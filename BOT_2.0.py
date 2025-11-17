@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Binance Trading Bot v2.0
+Zerodha F&O Trading Bot v2.0
+For Nifty50 and BankNifty Futures & Options Trading
 Enhanced with risk management, logging, and multiple strategies
 """
 
-import websocket
 import json
 import numpy as np
 import talib
@@ -13,13 +13,19 @@ import logging
 import csv
 import time
 import sys
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
-from binance.client import Client
-from binance.enums import *
-from binance.exceptions import BinanceAPIException, BinanceRequestException
+
+# Kite Connect imports
+try:
+    from kiteconnect import KiteConnect, KiteTicker
+    KITE_AVAILABLE = True
+except ImportError:
+    KITE_AVAILABLE = False
+    print("WARNING: kiteconnect not installed. Install with: pip install kiteconnect")
+
 import config
 
 
@@ -31,10 +37,12 @@ import config
 class Trade:
     """Represents a single trade"""
     timestamp: str
-    symbol: str
-    side: str
+    instrument: str
+    trading_symbol: str
+    side: str  # BUY or SELL
     price: float
-    quantity: float
+    quantity: int  # Number of shares (lots * lot_size)
+    lots: int
     value: float
     strategy: str
     pnl: float = 0.0
@@ -46,13 +54,27 @@ class Trade:
 @dataclass
 class Position:
     """Represents current position"""
-    symbol: str
+    instrument: str
+    trading_symbol: str
+    instrument_token: int
     entry_price: float
-    quantity: float
-    side: str  # 'LONG' or 'FLAT'
+    quantity: int
+    lots: int
+    side: str  # 'LONG' or 'SHORT'
     stop_loss: float
     take_profit: float
     entry_time: str
+
+
+@dataclass
+class FNOContract:
+    """Represents an F&O contract"""
+    instrument: str  # NIFTY or BANKNIFTY
+    trading_symbol: str
+    instrument_token: int
+    lot_size: int
+    tick_size: float
+    expiry: str
 
 
 # ============================================================================
@@ -61,7 +83,7 @@ class Position:
 
 def setup_logging():
     """Configure logging with both file and console handlers"""
-    logger = logging.getLogger('TradingBot')
+    logger = logging.getLogger('ZerodhaTradingBot')
     logger.setLevel(getattr(logging, config.LOG_LEVEL))
 
     # File handler
@@ -105,8 +127,8 @@ class TradeJournal:
             with open(self.filename, 'x', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    'timestamp', 'symbol', 'side', 'price', 'quantity',
-                    'value', 'strategy', 'pnl', 'pnl_percent',
+                    'timestamp', 'instrument', 'trading_symbol', 'side', 'price',
+                    'quantity', 'lots', 'value', 'strategy', 'pnl', 'pnl_percent',
                     'stop_loss', 'take_profit'
                 ])
         except FileExistsError:
@@ -118,9 +140,9 @@ class TradeJournal:
         with open(self.filename, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                trade.timestamp, trade.symbol, trade.side, trade.price,
-                trade.quantity, trade.value, trade.strategy, trade.pnl,
-                trade.pnl_percent, trade.stop_loss, trade.take_profit
+                trade.timestamp, trade.instrument, trade.trading_symbol, trade.side,
+                trade.price, trade.quantity, trade.lots, trade.value, trade.strategy,
+                trade.pnl, trade.pnl_percent, trade.stop_loss, trade.take_profit
             ])
 
     def update_daily_pnl(self, pnl: float):
@@ -168,24 +190,35 @@ class TradeJournal:
 # ============================================================================
 
 class RiskManager:
-    """Manages risk and position sizing"""
+    """Manages risk and position sizing for F&O trading"""
 
     def __init__(self, journal: TradeJournal, logger: logging.Logger):
         self.journal = journal
         self.logger = logger
 
-    def calculate_position_size(self, balance: float, price: float) -> float:
-        """Calculate position size based on risk parameters"""
+    def calculate_lots(self, capital: float, price: float, lot_size: int) -> int:
+        """Calculate number of lots based on risk parameters"""
         # Risk-based position sizing
-        risk_amount = balance * config.RISK_PER_TRADE
-        max_position_value = balance * config.MAX_POSITION_SIZE
+        risk_amount = capital * config.RISK_PER_TRADE
+        max_position_value = capital * config.MAX_POSITION_SIZE
 
-        # Use the smaller of risk-based or max position
-        position_value = min(risk_amount / config.STOP_LOSS_PERCENT, max_position_value)
-        quantity = position_value / price
+        # Value per lot
+        lot_value = price * lot_size
 
-        self.logger.debug(f"Position size calculated: {quantity:.6f} (value: {position_value:.2f})")
-        return quantity
+        # Calculate max lots based on risk
+        risk_based_lots = int(risk_amount / (config.STOP_LOSS_PERCENT * lot_value))
+
+        # Calculate max lots based on position size limit
+        position_based_lots = int(max_position_value / lot_value)
+
+        # Use minimum of risk-based or position-based or max lots
+        calculated_lots = min(risk_based_lots, position_based_lots, config.MAX_LOTS)
+
+        # Ensure at least 1 lot
+        lots = max(1, calculated_lots)
+
+        self.logger.debug(f"Lots calculated: {lots} (value: {lots * lot_value:.2f} INR)")
+        return lots
 
     def calculate_stop_loss(self, entry_price: float, side: str) -> float:
         """Calculate stop loss price"""
@@ -229,47 +262,57 @@ class RiskManager:
 # ============================================================================
 
 class PaperTrader:
-    """Simulates trading without real money"""
+    """Simulates F&O trading without real money"""
 
     def __init__(self, initial_balance: float, logger: logging.Logger):
         self.balance = initial_balance
         self.initial_balance = initial_balance
-        self.holdings: Dict[str, float] = {}
+        self.positions: Dict[str, Dict] = {}
         self.logger = logger
 
-    def get_balance(self, asset: str = 'USDT') -> float:
-        """Get balance of an asset"""
-        if asset == 'USDT':
-            return self.balance
-        return self.holdings.get(asset, 0.0)
+    def get_balance(self) -> float:
+        """Get current balance"""
+        return self.balance
 
-    def execute_buy(self, symbol: str, quantity: float, price: float) -> bool:
-        """Execute a paper buy order"""
-        cost = quantity * price
-        if cost > self.balance:
-            self.logger.warning(f"Insufficient balance for buy: {cost:.2f} > {self.balance:.2f}")
+    def execute_buy(self, symbol: str, quantity: int, price: float, lots: int) -> bool:
+        """Execute a paper buy order (go long)"""
+        # For futures, margin is typically around 10-15% of contract value
+        margin_required = quantity * price * 0.12  # ~12% margin
+
+        if margin_required > self.balance:
+            self.logger.warning(f"Insufficient margin: {margin_required:.2f} > {self.balance:.2f}")
             return False
 
-        self.balance -= cost
-        asset = symbol.replace('USDT', '')
-        self.holdings[asset] = self.holdings.get(asset, 0) + quantity
+        self.balance -= margin_required  # Block margin
+        self.positions[symbol] = {
+            'quantity': quantity,
+            'lots': lots,
+            'price': price,
+            'margin': margin_required
+        }
 
-        self.logger.info(f"PAPER BUY: {quantity:.6f} {asset} @ {price:.2f} (Cost: {cost:.2f})")
+        self.logger.info(f"PAPER BUY: {lots} lots ({quantity} qty) @ {price:.2f}")
+        self.logger.info(f"Margin blocked: {margin_required:.2f} INR")
         return True
 
-    def execute_sell(self, symbol: str, quantity: float, price: float) -> bool:
-        """Execute a paper sell order"""
-        asset = symbol.replace('USDT', '')
-        if self.holdings.get(asset, 0) < quantity:
-            self.logger.warning(f"Insufficient holdings for sell")
-            return False
+    def execute_sell(self, symbol: str, quantity: int, price: float, entry_price: float) -> float:
+        """Execute a paper sell order (square off long position)"""
+        if symbol not in self.positions:
+            self.logger.warning(f"No position found for {symbol}")
+            return 0.0
 
-        revenue = quantity * price
-        self.holdings[asset] -= quantity
-        self.balance += revenue
+        position = self.positions[symbol]
+        # Calculate P&L
+        pnl = (price - entry_price) * quantity
 
-        self.logger.info(f"PAPER SELL: {quantity:.6f} {asset} @ {price:.2f} (Revenue: {revenue:.2f})")
-        return True
+        # Release margin and add P&L
+        self.balance += position['margin'] + pnl
+
+        self.logger.info(f"PAPER SELL: {position['lots']} lots ({quantity} qty) @ {price:.2f}")
+        self.logger.info(f"P&L: {pnl:.2f} INR")
+
+        del self.positions[symbol]
+        return pnl
 
 
 # ============================================================================
@@ -289,7 +332,7 @@ class Strategy(ABC):
         pass
 
     @abstractmethod
-    def process_candle(self, o: float, h: float, l: float, c: float) -> Optional[str]:
+    def process_candle(self, o: float, h: float, l: float, c: float, v: float) -> Optional[str]:
         """Process a candle and return signal: 'BUY', 'SELL', or None"""
         pass
 
@@ -352,7 +395,7 @@ class WWTStrategy(Strategy):
 
         self.logger.info("WWT Strategy initialized successfully!")
 
-    def process_candle(self, o: float, h: float, l: float, c: float) -> Optional[str]:
+    def process_candle(self, o: float, h: float, l: float, c: float, v: float) -> Optional[str]:
         """Process candle and return trading signal"""
         ap_calc = (h + l + c) / 3
         self.ap.append(float(ap_calc))
@@ -404,7 +447,7 @@ class WWTStrategy(Strategy):
 
 
 class ORBStrategy(Strategy):
-    """Opening Range Breakout Strategy"""
+    """Opening Range Breakout Strategy - Perfect for Nifty/BankNifty"""
 
     def __init__(self, logger: logging.Logger):
         super().__init__(logger)
@@ -417,7 +460,7 @@ class ORBStrategy(Strategy):
     def initialize(self, historical_data: pd.DataFrame):
         """Initialize ORB strategy"""
         self.logger.info("Initializing ORB Strategy...")
-        self.logger.info(f"Will establish range from first {config.ORB_PERIOD} candles")
+        self.logger.info(f"Will establish range from first {config.ORB_PERIOD} candles after market open")
 
         # Reset state
         self.orb_high = None
@@ -427,7 +470,7 @@ class ORBStrategy(Strategy):
 
         self.logger.info("ORB Strategy initialized!")
 
-    def process_candle(self, o: float, h: float, l: float, c: float) -> Optional[str]:
+    def process_candle(self, o: float, h: float, l: float, c: float, v: float) -> Optional[str]:
         """Process candle and return trading signal"""
         # Phase 1: Build opening range
         if not self.orb_range_set:
@@ -449,7 +492,7 @@ class ORBStrategy(Strategy):
                 self.logger.info(f"OPENING RANGE ESTABLISHED!")
                 self.logger.info(f"  High: {self.orb_high:.2f}")
                 self.logger.info(f"  Low: {self.orb_low:.2f}")
-                self.logger.info(f"  Size: {range_size:.2f}")
+                self.logger.info(f"  Size: {range_size:.2f} points")
 
             return None
 
@@ -483,8 +526,8 @@ class ORBStrategy(Strategy):
 # MAIN TRADING BOT
 # ============================================================================
 
-class TradingBot:
-    """Main trading bot orchestrator"""
+class ZerodhaTradingBot:
+    """Main trading bot orchestrator for Zerodha F&O"""
 
     def __init__(self):
         self.logger = setup_logging()
@@ -492,49 +535,40 @@ class TradingBot:
         self.risk_manager = RiskManager(self.journal, self.logger)
         self.strategy: Optional[Strategy] = None
         self.position: Optional[Position] = None
-        self.symbol = ''
-        self.trade_symbol = ''
-        self.kline = ''
-        self.socket_url = ''
-        self.ws = None
-        self.reconnect_count = 0
+        self.contract: Optional[FNOContract] = None
+        self.kite = None
+        self.kws = None
         self.running = False
+        self.last_tick = {}
 
         # Paper or live trading
         if config.PAPER_TRADING:
             self.paper_trader = PaperTrader(config.INITIAL_PAPER_BALANCE, self.logger)
             self.initial_balance = config.INITIAL_PAPER_BALANCE
-            self.client = None
             self.logger.info("Running in PAPER TRADING mode")
         else:
             self.paper_trader = None
-            self.client = Client(config.KEY, config.SECRET, tld='com')
-            self.initial_balance = self._get_usdt_balance()
             self.logger.info("Running in LIVE TRADING mode")
+
+            if KITE_AVAILABLE and config.KITE_API_KEY and config.KITE_ACCESS_TOKEN:
+                self.kite = KiteConnect(api_key=config.KITE_API_KEY)
+                self.kite.set_access_token(config.KITE_ACCESS_TOKEN)
+                self.initial_balance = self._get_available_margin()
+            else:
+                self.initial_balance = 0.0
 
         self.journal.update_balance(self.initial_balance)
         self.journal.peak_balance = self.initial_balance
 
-    def _get_usdt_balance(self) -> float:
-        """Get USDT balance from Binance"""
+    def _get_available_margin(self) -> float:
+        """Get available margin from Zerodha"""
         try:
-            if self.paper_trader:
-                return self.paper_trader.get_balance('USDT')
-            balance = self.client.get_asset_balance(asset='USDT')
-            return float(balance['free'])
-        except Exception as e:
-            self.logger.error(f"Error getting balance: {e}")
+            if self.kite:
+                margins = self.kite.margins()
+                return float(margins['equity']['available']['live_balance'])
             return 0.0
-
-    def _get_asset_balance(self, asset: str) -> float:
-        """Get asset balance"""
-        try:
-            if self.paper_trader:
-                return self.paper_trader.get_balance(asset)
-            balance = self.client.get_asset_balance(asset=asset)
-            return float(balance['free'])
         except Exception as e:
-            self.logger.error(f"Error getting {asset} balance: {e}")
+            self.logger.error(f"Error getting margin: {e}")
             return 0.0
 
     def _validate_input(self, prompt: str, valid_options: List[str]) -> str:
@@ -545,30 +579,102 @@ class TradingBot:
                 return user_input
             print(f"Invalid input. Valid options: {', '.join(valid_options)}")
 
-    def select_instrument(self):
-        """Interactive instrument selection"""
+    def select_instrument(self) -> FNOContract:
+        """Select F&O instrument to trade"""
         print("\n" + "=" * 50)
         print("        INSTRUMENT SELECTION")
         print("=" * 50)
-        print("1. NIFTY50 (BTC as proxy)")
-        print("2. BANKNIFTY (ETH as proxy)")
-        print("3. Custom Symbol")
+        print("1. NIFTY 50 Futures")
+        print("2. BANKNIFTY Futures")
         print("=" * 50)
 
-        choice = self._validate_input("Select instrument (1-3): ", ['1', '2', '3'])
+        choice = self._validate_input("Select instrument (1-2): ", ['1', '2'])
 
         if choice == '1':
-            return 'BTC', 'NIFTY50'
-        elif choice == '2':
-            return 'ETH', 'BANKNIFTY'
+            instrument = 'NIFTY'
+            lot_size = config.NIFTY_LOT_SIZE
+            tick_size = config.NIFTY_TICK_SIZE
         else:
-            custom = input("Enter symbol (e.g., BTC, ETH, BNB): ").strip().upper()
-            if not custom:
-                print("Invalid symbol. Using BTC.")
-                custom = 'BTC'
-            return custom, custom
+            instrument = 'BANKNIFTY'
+            lot_size = config.BANKNIFTY_LOT_SIZE
+            tick_size = config.BANKNIFTY_TICK_SIZE
 
-    def select_strategy(self):
+        # Get current month expiry (last Thursday of the month)
+        expiry = self._get_current_expiry()
+        trading_symbol = f"{instrument}{expiry}FUT"
+
+        # Get instrument token (in live mode)
+        instrument_token = self._get_instrument_token(trading_symbol)
+
+        contract = FNOContract(
+            instrument=instrument,
+            trading_symbol=trading_symbol,
+            instrument_token=instrument_token,
+            lot_size=lot_size,
+            tick_size=tick_size,
+            expiry=expiry
+        )
+
+        self.logger.info(f"Selected: {trading_symbol} (Lot size: {lot_size})")
+        return contract
+
+    def _get_current_expiry(self) -> str:
+        """Get current month expiry date string"""
+        today = date.today()
+
+        # Find last Thursday of current month
+        year = today.year
+        month = today.month
+
+        # Get last day of month
+        if month == 12:
+            next_month = date(year + 1, 1, 1)
+        else:
+            next_month = date(year, month + 1, 1)
+        last_day = next_month - timedelta(days=1)
+
+        # Find last Thursday
+        days_since_thursday = (last_day.weekday() - 3) % 7
+        last_thursday = last_day - timedelta(days=days_since_thursday)
+
+        # If expiry has passed, use next month
+        if today > last_thursday:
+            if month == 12:
+                month = 1
+                year += 1
+            else:
+                month += 1
+
+            if month == 12:
+                next_month = date(year + 1, 1, 1)
+            else:
+                next_month = date(year, month + 1, 1)
+            last_day = next_month - timedelta(days=1)
+            days_since_thursday = (last_day.weekday() - 3) % 7
+            last_thursday = last_day - timedelta(days=days_since_thursday)
+
+        # Format: YYMMMDD (e.g., 24NOV28)
+        month_names = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
+                       'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
+        expiry_str = f"{last_thursday.year % 100}{month_names[last_thursday.month - 1]}{last_thursday.day:02d}"
+
+        return expiry_str
+
+    def _get_instrument_token(self, trading_symbol: str) -> int:
+        """Get instrument token for the trading symbol"""
+        if self.kite and not config.PAPER_TRADING:
+            try:
+                instruments = self.kite.instruments("NFO")
+                for inst in instruments:
+                    if inst['tradingsymbol'] == trading_symbol:
+                        return inst['instrument_token']
+            except Exception as e:
+                self.logger.error(f"Error fetching instrument token: {e}")
+
+        # Return mock token for paper trading
+        return 12345678
+
+    def select_strategy(self) -> Strategy:
         """Interactive strategy selection"""
         print("\n" + "=" * 50)
         print("        STRATEGY SELECTION")
@@ -577,7 +683,7 @@ class TradingBot:
         print("   - Crossover-based trend following")
         print("")
         print("2. Opening Range Breakout (ORB) Strategy")
-        print("   - Momentum-based breakout trading")
+        print("   - Perfect for Nifty/BankNifty intraday")
         print("=" * 50)
 
         choice = self._validate_input("Select strategy (1-2): ", ['1', '2'])
@@ -589,96 +695,78 @@ class TradingBot:
 
     def select_timeframe(self) -> str:
         """Interactive timeframe selection"""
-        valid_timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '12h', '1d', '3d', '1w', '1M']
+        valid_timeframes = ['minute', '3minute', '5minute', '15minute', '30minute', '60minute', 'day']
 
         print("\n" + "=" * 50)
         print("        TIMEFRAME SELECTION")
         print("=" * 50)
         print(f"Available: {', '.join(valid_timeframes)}")
+        print("Recommended for intraday: 5minute or 15minute")
         print("=" * 50)
 
         return self._validate_input("Enter timeframe: ", valid_timeframes)
 
-    def fetch_historical_data(self) -> pd.DataFrame:
+    def fetch_historical_data(self, timeframe: str) -> pd.DataFrame:
         """Fetch historical candle data for strategy initialization"""
-        self.logger.info(f"Fetching historical data for {self.trade_symbol}...")
+        self.logger.info(f"Fetching historical data for {self.contract.trading_symbol}...")
 
         try:
-            # Check if API keys are available
-            if not config.KEY or not config.SECRET:
-                self.logger.warning("API keys not configured. Using mock historical data for testing.")
-                # Generate mock data for testing without API keys
+            # Check if API is available
+            if not self.kite or not config.KITE_ACCESS_TOKEN:
+                self.logger.warning("Kite API not configured. Using mock historical data.")
                 return self._generate_mock_historical_data()
 
-            if self.paper_trader:
-                # For paper trading, we still need real market data
-                temp_client = Client(config.KEY, config.SECRET, tld='com')
-                hist_data = temp_client.get_klines(
-                    symbol=self.trade_symbol,
-                    interval=self.kline,
-                    limit=50
-                )
-            else:
-                hist_data = self.client.get_klines(
-                    symbol=self.trade_symbol,
-                    interval=self.kline,
-                    limit=50
-                )
+            # Fetch from Kite
+            from_date = datetime.now() - timedelta(days=5)
+            to_date = datetime.now()
+
+            hist_data = self.kite.historical_data(
+                self.contract.instrument_token,
+                from_date,
+                to_date,
+                timeframe
+            )
 
             df = pd.DataFrame(hist_data)
-            df.columns = [
-                'open_time', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'qav', 'num_trades', 'taker_base_vol',
-                'taker_quote_vol', 'is_best_match'
-            ]
-
-            # Convert to float
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = df[col].astype(float)
+            df.columns = ['date', 'open', 'high', 'low', 'close', 'volume']
 
             self.logger.info(f"Fetched {len(df)} historical candles")
             return df
 
-        except BinanceAPIException as e:
-            self.logger.error(f"Binance API error: {e}")
-            raise
         except Exception as e:
             self.logger.error(f"Error fetching historical data: {e}")
-            raise
+            self.logger.warning("Using mock data for testing")
+            return self._generate_mock_historical_data()
 
     def _generate_mock_historical_data(self) -> pd.DataFrame:
-        """Generate mock historical data for testing without API keys"""
+        """Generate mock historical data for testing"""
         self.logger.info("Generating mock historical data...")
 
-        # Create 50 mock candles with realistic price movements
-        base_price = 50000.0  # Base price for BTC
-        data = []
+        # Base price for Nifty/BankNifty
+        if self.contract.instrument == 'NIFTY':
+            base_price = 19500.0
+        else:
+            base_price = 44500.0
 
+        data = []
         for i in range(50):
-            # Simulate price movement
-            change = np.random.randn() * 100
+            change = np.random.randn() * 50
             open_price = base_price + change
-            high_price = open_price + abs(np.random.randn() * 50)
-            low_price = open_price - abs(np.random.randn() * 50)
-            close_price = open_price + np.random.randn() * 30
-            volume = np.random.randint(100, 1000)
+            high_price = open_price + abs(np.random.randn() * 30)
+            low_price = open_price - abs(np.random.randn() * 30)
+            close_price = open_price + np.random.randn() * 20
+            volume = np.random.randint(10000, 100000)
 
             data.append({
-                'open_time': i,
+                'date': datetime.now() - timedelta(minutes=(50-i)*5),
                 'open': open_price,
                 'high': high_price,
                 'low': low_price,
                 'close': close_price,
-                'volume': volume,
-                'close_time': i,
-                'qav': 0,
-                'num_trades': 0,
-                'taker_base_vol': 0,
-                'taker_quote_vol': 0,
-                'is_best_match': True
+                'volume': volume
             })
 
-            base_price = close_price  # Update base for next candle
+            base_price = close_price
 
         df = pd.DataFrame(data)
         self.logger.info(f"Generated {len(df)} mock candles")
@@ -693,9 +781,10 @@ class TradingBot:
         timestamp = datetime.now().isoformat()
 
         if side == 'BUY' and self.position is None:
-            # Calculate position size
-            balance = self._get_usdt_balance()
-            quantity = self.risk_manager.calculate_position_size(balance, price)
+            # Calculate lots
+            balance = self.paper_trader.get_balance() if self.paper_trader else self._get_available_margin()
+            lots = self.risk_manager.calculate_lots(balance, price, self.contract.lot_size)
+            quantity = lots * self.contract.lot_size
 
             # Calculate stop loss and take profit
             stop_loss = self.risk_manager.calculate_stop_loss(price, 'BUY')
@@ -703,27 +792,35 @@ class TradingBot:
 
             # Execute order
             if self.paper_trader:
-                success = self.paper_trader.execute_buy(self.trade_symbol, quantity, price)
+                success = self.paper_trader.execute_buy(
+                    self.contract.trading_symbol, quantity, price, lots
+                )
             else:
                 try:
-                    # Live order (commented for safety)
-                    # order = self.client.create_order(
-                    #     symbol=self.trade_symbol,
-                    #     side=SIDE_BUY,
-                    #     type=ORDER_TYPE_MARKET,
-                    #     quantity=quantity
-                    # )
+                    # Live order
+                    order_id = self.kite.place_order(
+                        variety=self.kite.VARIETY_REGULAR,
+                        exchange=self.kite.EXCHANGE_NFO,
+                        tradingsymbol=self.contract.trading_symbol,
+                        transaction_type=self.kite.TRANSACTION_TYPE_BUY,
+                        quantity=quantity,
+                        product=self.kite.PRODUCT_MIS,  # Intraday
+                        order_type=self.kite.ORDER_TYPE_MARKET
+                    )
                     success = True
-                    self.logger.info(f"LIVE BUY ORDER: {quantity:.6f} @ {price:.2f}")
+                    self.logger.info(f"Order placed: {order_id}")
                 except Exception as e:
                     self.logger.error(f"Order execution failed: {e}")
                     success = False
 
             if success:
                 self.position = Position(
-                    symbol=self.trade_symbol,
+                    instrument=self.contract.instrument,
+                    trading_symbol=self.contract.trading_symbol,
+                    instrument_token=self.contract.instrument_token,
                     entry_price=price,
                     quantity=quantity,
+                    lots=lots,
                     side='LONG',
                     stop_loss=stop_loss,
                     take_profit=take_profit,
@@ -732,10 +829,12 @@ class TradingBot:
 
                 trade = Trade(
                     timestamp=timestamp,
-                    symbol=self.trade_symbol,
+                    instrument=self.contract.instrument,
+                    trading_symbol=self.contract.trading_symbol,
                     side='BUY',
                     price=price,
                     quantity=quantity,
+                    lots=lots,
                     value=quantity * price,
                     strategy=self.strategy.name,
                     stop_loss=stop_loss,
@@ -744,9 +843,10 @@ class TradingBot:
                 self.journal.record_trade(trade)
 
                 self.logger.info(f"{'='*50}")
-                self.logger.info(f"  BUY ORDER EXECUTED")
+                self.logger.info(f"  BUY ORDER EXECUTED - {self.contract.instrument}")
                 self.logger.info(f"  Price: {price:.2f}")
-                self.logger.info(f"  Quantity: {quantity:.6f}")
+                self.logger.info(f"  Lots: {lots} (Qty: {quantity})")
+                self.logger.info(f"  Value: {quantity * price:.2f} INR")
                 self.logger.info(f"  Stop Loss: {stop_loss:.2f}")
                 self.logger.info(f"  Take Profit: {take_profit:.2f}")
                 self.logger.info(f"{'='*50}")
@@ -754,36 +854,45 @@ class TradingBot:
         elif side == 'SELL' and self.position is not None:
             quantity = self.position.quantity
             entry_price = self.position.entry_price
+            lots = self.position.lots
 
             # Execute order
             if self.paper_trader:
-                success = self.paper_trader.execute_sell(self.trade_symbol, quantity, price)
+                pnl = self.paper_trader.execute_sell(
+                    self.contract.trading_symbol, quantity, price, entry_price
+                )
+                success = True
             else:
                 try:
-                    # Live order (commented for safety)
-                    # order = self.client.create_order(
-                    #     symbol=self.trade_symbol,
-                    #     side=SIDE_SELL,
-                    #     type=ORDER_TYPE_MARKET,
-                    #     quantity=quantity
-                    # )
+                    # Live order
+                    order_id = self.kite.place_order(
+                        variety=self.kite.VARIETY_REGULAR,
+                        exchange=self.kite.EXCHANGE_NFO,
+                        tradingsymbol=self.contract.trading_symbol,
+                        transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+                        quantity=quantity,
+                        product=self.kite.PRODUCT_MIS,
+                        order_type=self.kite.ORDER_TYPE_MARKET
+                    )
                     success = True
-                    self.logger.info(f"LIVE SELL ORDER: {quantity:.6f} @ {price:.2f}")
+                    self.logger.info(f"Order placed: {order_id}")
+                    pnl = (price - entry_price) * quantity
                 except Exception as e:
                     self.logger.error(f"Order execution failed: {e}")
                     success = False
+                    pnl = 0.0
 
             if success:
-                # Calculate P&L
-                pnl = (price - entry_price) * quantity
                 pnl_percent = (price - entry_price) / entry_price
 
                 trade = Trade(
                     timestamp=timestamp,
-                    symbol=self.trade_symbol,
+                    instrument=self.contract.instrument,
+                    trading_symbol=self.contract.trading_symbol,
                     side='SELL',
                     price=price,
                     quantity=quantity,
+                    lots=lots,
                     value=quantity * price,
                     strategy=self.strategy.name,
                     pnl=pnl,
@@ -793,15 +902,15 @@ class TradingBot:
                 self.journal.update_daily_pnl(pnl)
 
                 # Update balance
-                new_balance = self._get_usdt_balance()
+                new_balance = self.paper_trader.get_balance() if self.paper_trader else self._get_available_margin()
                 self.journal.update_balance(new_balance)
 
                 self.logger.info(f"{'='*50}")
-                self.logger.info(f"  SELL ORDER EXECUTED")
+                self.logger.info(f"  SELL ORDER EXECUTED - {self.contract.instrument}")
                 self.logger.info(f"  Price: {price:.2f}")
-                self.logger.info(f"  Quantity: {quantity:.6f}")
-                self.logger.info(f"  P&L: {pnl:.2f} ({pnl_percent:.2%})")
-                self.logger.info(f"  Balance: {new_balance:.2f} USDT")
+                self.logger.info(f"  Lots: {lots} (Qty: {quantity})")
+                self.logger.info(f"  P&L: {pnl:.2f} INR ({pnl_percent:.2%})")
+                self.logger.info(f"  Balance: {new_balance:.2f} INR")
                 self.logger.info(f"{'='*50}")
 
                 self.position = None
@@ -819,91 +928,65 @@ class TradingBot:
             self.logger.info(f"TAKE PROFIT TRIGGERED @ {current_price:.2f}")
             self.execute_order('SELL', current_price, 'TAKE_PROFIT')
 
-    def on_open(self, ws):
-        """WebSocket connection opened"""
-        self.logger.info("WebSocket connection opened")
-        self.logger.info(f"Trading {self.trade_symbol} with {self.strategy.name} strategy")
-        self.reconnect_count = 0
-
-    def on_close(self, ws, *args):
-        """WebSocket connection closed"""
-        # Handle different websocket-client versions (some pass close_status_code and close_msg)
-        if len(args) >= 2:
-            close_status_code, close_msg = args[0], args[1]
-            self.logger.warning(f"WebSocket closed: {close_status_code} - {close_msg}")
-        elif len(args) == 1:
-            self.logger.warning(f"WebSocket closed: {args[0]}")
-        else:
-            self.logger.warning("WebSocket connection closed")
-
-        if self.running and self.reconnect_count < config.WS_RECONNECT_ATTEMPTS:
-            self.reconnect_count += 1
-            delay = config.WS_RECONNECT_DELAY * self.reconnect_count
-            self.logger.info(f"Reconnecting in {delay} seconds (attempt {self.reconnect_count})")
-            time.sleep(delay)
-            self._connect_websocket()
-
-    def on_error(self, ws, error):
-        """WebSocket error handler"""
-        self.logger.error(f"WebSocket error: {error}")
-
-    def on_message(self, ws, message):
-        """Process incoming WebSocket message"""
-        try:
-            data = json.loads(message)
-            candle = data['k']
-            is_closed = candle['x']
-
-            o = float(candle['o'])
-            h = float(candle['h'])
-            l = float(candle['l'])
-            c = float(candle['c'])
-
-            # Check stop loss / take profit on every tick
-            if self.position:
-                self.check_stop_loss_take_profit(c)
-
-            # Process strategy only on candle close
-            if is_closed:
-                self.logger.info(f"Candle closed @ {c:.2f}")
-
-                # Get strategy signal
-                signal = self.strategy.process_candle(o, h, l, c)
-
-                if signal == 'BUY' and self.position is None:
-                    self.execute_order('BUY', c)
-                elif signal == 'SELL' and self.position is not None:
-                    self.execute_order('SELL', c)
-
-        except json.JSONDecodeError as e:
-            self.logger.error(f"JSON decode error: {e}")
-        except KeyError as e:
-            self.logger.error(f"Missing key in message: {e}")
-        except Exception as e:
-            self.logger.error(f"Error processing message: {e}")
-
-    def _connect_websocket(self):
-        """Establish WebSocket connection"""
-        self.ws = websocket.WebSocketApp(
-            self.socket_url,
-            on_open=self.on_open,
-            on_close=self.on_close,
-            on_message=self.on_message,
-            on_error=self.on_error
+    def is_market_open(self) -> bool:
+        """Check if market is currently open"""
+        now = datetime.now()
+        market_open = now.replace(
+            hour=config.MARKET_OPEN_HOUR,
+            minute=config.MARKET_OPEN_MINUTE,
+            second=0
         )
-        self.ws.run_forever()
+        market_close = now.replace(
+            hour=config.MARKET_CLOSE_HOUR,
+            minute=config.MARKET_CLOSE_MINUTE,
+            second=0
+        )
 
-    def display_config_summary(self, instrument_name: str):
+        # Check if it's a weekday
+        if now.weekday() >= 5:  # Saturday or Sunday
+            return False
+
+        return market_open <= now <= market_close
+
+    def on_ticks(self, ws, ticks):
+        """Handle incoming tick data from Kite WebSocket"""
+        for tick in ticks:
+            if tick['instrument_token'] == self.contract.instrument_token:
+                self.last_tick = tick
+
+                ltp = tick['last_price']
+                self.logger.debug(f"Tick: {ltp:.2f}")
+
+                # Check stop loss / take profit
+                if self.position:
+                    self.check_stop_loss_take_profit(ltp)
+
+    def on_connect(self, ws, response):
+        """Handle WebSocket connection"""
+        self.logger.info("WebSocket connected")
+        # Subscribe to instrument
+        ws.subscribe([self.contract.instrument_token])
+        ws.set_mode(ws.MODE_FULL, [self.contract.instrument_token])
+
+    def on_close(self, ws, code, reason):
+        """Handle WebSocket disconnection"""
+        self.logger.warning(f"WebSocket closed: {code} - {reason}")
+
+    def on_error(self, ws, code, reason):
+        """Handle WebSocket errors"""
+        self.logger.error(f"WebSocket error: {code} - {reason}")
+
+    def display_config_summary(self):
         """Display configuration summary"""
         print(f"\n{'='*50}")
         print(f"  CONFIGURATION SUMMARY")
         print(f"{'='*50}")
         print(f"  Mode: {'PAPER' if config.PAPER_TRADING else 'LIVE'} TRADING")
-        print(f"  Instrument: {instrument_name}")
-        print(f"  Trading Pair: {self.trade_symbol}")
+        print(f"  Instrument: {self.contract.instrument}")
+        print(f"  Contract: {self.contract.trading_symbol}")
+        print(f"  Lot Size: {self.contract.lot_size}")
         print(f"  Strategy: {self.strategy.name}")
-        print(f"  Timeframe: {self.kline}")
-        print(f"  Initial Balance: {self.initial_balance:.2f} USDT")
+        print(f"  Initial Capital: {self.initial_balance:.2f} INR")
         print(f"{'='*50}")
         print(f"  RISK MANAGEMENT")
         print(f"{'='*50}")
@@ -913,13 +996,62 @@ class TradingBot:
         print(f"  Take Profit: {config.TAKE_PROFIT_PERCENT:.1%}")
         print(f"  Max Daily Loss: {config.MAX_DAILY_LOSS:.1%}")
         print(f"  Max Drawdown: {config.MAX_DRAWDOWN:.1%}")
+        print(f"  Max Lots: {config.MAX_LOTS}")
         print(f"{'='*50}")
+        print(f"  MARKET HOURS (IST)")
+        print(f"{'='*50}")
+        print(f"  Open: {config.MARKET_OPEN_HOUR:02d}:{config.MARKET_OPEN_MINUTE:02d}")
+        print(f"  Close: {config.MARKET_CLOSE_HOUR:02d}:{config.MARKET_CLOSE_MINUTE:02d}")
+        print(f"{'='*50}")
+
+    def run_paper_simulation(self, timeframe: str):
+        """Run paper trading simulation with historical data"""
+        self.logger.info("Starting paper trading simulation...")
+
+        # Generate simulated candles
+        candle_count = 0
+        base_price = 19500.0 if self.contract.instrument == 'NIFTY' else 44500.0
+
+        print("\nSimulating market data... Press Ctrl+C to stop\n")
+
+        try:
+            while self.running:
+                # Generate a candle
+                change = np.random.randn() * 30
+                o = base_price + change
+                h = o + abs(np.random.randn() * 20)
+                l = o - abs(np.random.randn() * 20)
+                c = o + np.random.randn() * 15
+                v = np.random.randint(10000, 50000)
+
+                candle_count += 1
+                self.logger.info(f"Candle #{candle_count} closed @ {c:.2f}")
+
+                # Process strategy
+                signal = self.strategy.process_candle(o, h, l, c, v)
+
+                if signal == 'BUY' and self.position is None:
+                    self.execute_order('BUY', c)
+                elif signal == 'SELL' and self.position is not None:
+                    self.execute_order('SELL', c)
+
+                # Check stop loss / take profit
+                if self.position:
+                    self.check_stop_loss_take_profit(c)
+
+                base_price = c
+
+                # Wait between candles (simulated)
+                time.sleep(2)
+
+        except KeyboardInterrupt:
+            self.logger.info("Simulation stopped by user")
 
     def run(self):
         """Main bot execution"""
         print("\n" + "=" * 50)
-        print("    BINANCE TRADING BOT v2.0")
-        print("    Enhanced with Risk Management")
+        print("    ZERODHA F&O TRADING BOT v2.0")
+        print("    For Nifty50 & BankNifty")
         print("=" * 50)
 
         # Validate configuration
@@ -931,35 +1063,28 @@ class TradingBot:
                 print("Configuration errors found. Please check .env file.")
                 return
             else:
-                # Paper trading mode - warn about missing keys but allow continuation
-                self.logger.warning("API keys not configured. Some features may be limited.")
-                print("\nWARNING: API keys not configured.")
-                print("Bot will run in offline/mock mode for testing.")
-                print("To connect to live market data, configure API keys in .env file.\n")
+                self.logger.warning("API credentials not configured. Running in simulation mode.")
+                print("\nWARNING: Kite API credentials not configured.")
+                print("Bot will run in paper trading simulation mode.\n")
 
         # Step 1: Select instrument
-        self.symbol, instrument_name = self.select_instrument()
-        self.trade_symbol = self.symbol + 'USDT'
-        self.logger.info(f"Selected instrument: {instrument_name} ({self.trade_symbol})")
+        self.contract = self.select_instrument()
+        self.logger.info(f"Selected contract: {self.contract.trading_symbol}")
 
         # Step 2: Select strategy
         self.strategy = self.select_strategy()
         self.logger.info(f"Selected strategy: {self.strategy.name}")
 
         # Step 3: Select timeframe
-        self.kline = self.select_timeframe()
-        self.logger.info(f"Selected timeframe: {self.kline}")
-
-        # Setup WebSocket URL
-        sym_lower = self.symbol.lower()
-        self.socket_url = f"wss://stream.binance.com:9443/ws/{sym_lower}usdt@kline_{self.kline}"
+        timeframe = self.select_timeframe()
+        self.logger.info(f"Selected timeframe: {timeframe}")
 
         # Display summary
-        self.display_config_summary(instrument_name)
+        self.display_config_summary()
 
         # Initialize strategy
         try:
-            historical_data = self.fetch_historical_data()
+            historical_data = self.fetch_historical_data(timeframe)
             self.strategy.initialize(historical_data)
         except Exception as e:
             self.logger.error(f"Failed to initialize strategy: {e}")
@@ -974,10 +1099,21 @@ class TradingBot:
 
         # Start trading
         self.running = True
-        self.logger.info("Starting WebSocket connection...")
+        self.logger.info("Starting trading bot...")
 
         try:
-            self._connect_websocket()
+            if config.PAPER_TRADING or not KITE_AVAILABLE:
+                # Paper trading simulation
+                self.run_paper_simulation(timeframe)
+            else:
+                # Live WebSocket connection
+                self.kws = KiteTicker(config.KITE_API_KEY, config.KITE_ACCESS_TOKEN)
+                self.kws.on_ticks = self.on_ticks
+                self.kws.on_connect = self.on_connect
+                self.kws.on_close = self.on_close
+                self.kws.on_error = self.on_error
+                self.kws.connect()
+
         except KeyboardInterrupt:
             self.logger.info("Bot stopped by user")
         finally:
@@ -986,7 +1122,10 @@ class TradingBot:
             if stats:
                 self.logger.info("Trading Statistics:")
                 for key, value in stats.items():
-                    self.logger.info(f"  {key}: {value}")
+                    if isinstance(value, float):
+                        self.logger.info(f"  {key}: {value:.4f}")
+                    else:
+                        self.logger.info(f"  {key}: {value}")
 
 
 # ============================================================================
@@ -994,5 +1133,5 @@ class TradingBot:
 # ============================================================================
 
 if __name__ == "__main__":
-    bot = TradingBot()
+    bot = ZerodhaTradingBot()
     bot.run()

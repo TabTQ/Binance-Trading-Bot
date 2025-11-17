@@ -1,47 +1,48 @@
-# Binance Trading Bot v2.0
+# Zerodha F&O Trading Bot v2.0
 
-A professional-grade cryptocurrency trading bot with risk management, multiple strategies, and comprehensive logging.
+A professional-grade trading bot for **Nifty50 and BankNifty Futures & Options** using Zerodha's Kite Connect API. Features comprehensive risk management, multiple strategies, and detailed trade journaling.
 
 ## Features
 
 ### Core Features
-- **Multiple Trading Strategies**: WWT (Weis Wave Volume) and ORB (Opening Range Breakout)
-- **Paper Trading Mode**: Test strategies without risking real money
-- **Risk Management**: Stop-loss, take-profit, position sizing, daily loss limits
-- **Trade Journal**: Automatic CSV logging of all trades with P&L tracking
-- **Performance Metrics**: Win rate, drawdown tracking, and statistics
+- **F&O Trading**: Nifty50 and BankNifty futures
+- **Multiple Strategies**: WWT (Weis Wave Volume) and ORB (Opening Range Breakout)
+- **Paper Trading Mode**: Test strategies without real money
+- **Automatic Contract Selection**: Handles expiry dates and contract symbols
+- **Lot-based Position Sizing**: Proper F&O lot size calculations
 
 ### Risk Management
 - Configurable risk per trade (default: 2%)
-- Maximum position size limits
+- Maximum lots limit
 - Automatic stop-loss and take-profit
-- Daily loss limit protection
-- Maximum drawdown circuit breaker
+- Margin-based position sizing
+- Daily loss limit protection (5%)
+- Maximum drawdown circuit breaker (10%)
 
-### Security
-- Environment variable-based configuration
-- No hardcoded API keys
-- `.gitignore` for sensitive files
-- Configuration validation
-
-### Reliability
-- WebSocket auto-reconnection
-- Comprehensive error handling
-- Detailed logging (file and console)
-- Graceful shutdown with statistics
+### Indian Market Features
+- Market hours awareness (9:15 AM - 3:30 PM IST)
+- Auto expiry calculation (last Thursday of month)
+- Intraday (MIS) product support
+- NSE F&O segment integration
 
 ## Technologies
 
-- **Binance API** - Market data and order execution
-- **WebSocket** - Real-time price streaming
+- **Kite Connect API** - Zerodha's trading API
+- **KiteTicker** - Real-time WebSocket data
 - **Pandas** - Data manipulation
 - **NumPy** - Numerical computations
 - **TA-Lib** - Technical analysis indicators
-- **python-dotenv** - Environment configuration
+
+## Prerequisites
+
+1. **Zerodha Account** with F&O trading enabled
+2. **Kite Connect Subscription** (₹2000/month)
+3. **Python 3.7+**
+4. **TA-Lib** (system-level installation required)
 
 ## Installation
 
-### 1. Install System Dependencies
+### 1. Install System Dependencies (TA-Lib)
 
 **Ubuntu/Debian:**
 ```bash
@@ -66,60 +67,65 @@ brew install ta-lib
 pip install -r requirements.txt
 ```
 
-### 3. Configure Environment
+### 3. Configure Kite Connect
 
-1. Copy the example environment file:
+1. **Create Kite Connect App:**
+   - Go to https://kite.trade/
+   - Create new app
+   - Get API Key and Secret
+
+2. **Copy environment template:**
 ```bash
 cp .env.example .env
 ```
 
-2. Edit `.env` with your settings:
+3. **Edit `.env` with your credentials:**
 ```bash
 nano .env
 ```
 
-3. Add your Binance API credentials:
-```
-BINANCE_API_KEY=your_api_key_here
-BINANCE_API_SECRET=your_api_secret_here
-```
+4. **Generate Access Token:**
+   The access token must be generated daily through Kite Connect's login flow.
+   See Kite Connect documentation for token generation.
 
 ## Configuration
 
-All configuration is done via environment variables in `.env`:
-
-### API Configuration
+### Zerodha API Credentials
 ```
-BINANCE_API_KEY=your_key
-BINANCE_API_SECRET=your_secret
+KITE_API_KEY=your_key
+KITE_API_SECRET=your_secret
+KITE_ACCESS_TOKEN=daily_generated_token
+```
+
+### F&O Settings
+```
+NIFTY_LOT_SIZE=25            # Check NSE for current lot size
+BANKNIFTY_LOT_SIZE=15        # Check NSE for current lot size
+MAX_LOTS=10                  # Maximum lots to trade
 ```
 
 ### Risk Management
 ```
 RISK_PER_TRADE=0.02          # 2% risk per trade
-MAX_POSITION_SIZE=0.5        # Max 50% of balance
-STOP_LOSS_PERCENT=0.02       # 2% stop loss
-TAKE_PROFIT_PERCENT=0.04     # 4% take profit
+MAX_POSITION_SIZE=0.5        # Max 50% of capital
+STOP_LOSS_PERCENT=0.01       # 1% stop loss (tighter for F&O)
+TAKE_PROFIT_PERCENT=0.02     # 2% take profit
 MAX_DAILY_LOSS=0.05          # 5% daily loss limit
 MAX_DRAWDOWN=0.10            # 10% max drawdown
 ```
 
 ### Trading Mode
 ```
-PAPER_TRADING=true           # Paper trading (no real money)
-INITIAL_PAPER_BALANCE=10000  # Starting paper balance
+PAPER_TRADING=true           # Paper trading (default)
+INITIAL_PAPER_BALANCE=100000 # 1 Lakh INR starting capital
 ```
 
-### Strategy Parameters
+### Market Hours (IST)
 ```
-# WWT Strategy
-WWT_EMA_PERIOD=10
-WWT_CI_EMA_PERIOD=21
-WWT_WT2_SMA_PERIOD=4
-
-# ORB Strategy
-ORB_PERIOD=3                 # Candles for opening range
-ORB_BREAKOUT_BUFFER=0.001    # 0.1% breakout buffer
+MARKET_OPEN_HOUR=9
+MARKET_OPEN_MINUTE=15
+MARKET_CLOSE_HOUR=15
+MARKET_CLOSE_MINUTE=30
 ```
 
 ## Usage
@@ -132,16 +138,15 @@ python BOT_2.0.py
 ### Interactive Setup
 
 1. **Select Instrument:**
-   - NIFTY50 (BTC proxy)
-   - BANKNIFTY (ETH proxy)
-   - Custom symbol
+   - NIFTY 50 Futures
+   - BANKNIFTY Futures
 
 2. **Select Strategy:**
    - Weis Wave Volume (WWT) - Trend following
-   - Opening Range Breakout (ORB) - Momentum trading
+   - Opening Range Breakout (ORB) - Perfect for Nifty/BankNifty intraday
 
 3. **Select Timeframe:**
-   - 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 12h, 1d, 3d, 1w, 1M
+   - minute, 3minute, 5minute (recommended), 15minute (recommended), 30minute, 60minute, day
 
 4. **Review Configuration**
 
@@ -156,101 +161,140 @@ python BOT_2.0.py
 - Good for trending markets
 
 ### Opening Range Breakout (ORB)
-- Establishes price range from first N candles
+- **Perfect for Nifty/BankNifty intraday trading**
+- Establishes price range from first N candles after market open
 - BUY on breakout above range high
 - SELL on breakdown below range low
-- Good for momentum and volatility
+- Most effective with 15-minute or 5-minute candles
 
-## Output Files
+## F&O Contract Handling
 
-- **`trading_bot.log`** - Detailed execution logs
-- **`trade_journal.csv`** - Complete trade history with P&L
+The bot automatically:
+- Calculates current month expiry (last Thursday)
+- Generates trading symbol (e.g., `NIFTY24NOV28FUT`)
+- Fetches instrument token from NFO segment
+- Handles lot-based quantity calculations
 
-## Trade Journal Columns
+## Trade Journal
+
+All trades are logged to `trade_journal.csv`:
 
 | Column | Description |
 |--------|-------------|
-| timestamp | Trade execution time |
-| symbol | Trading pair |
+| timestamp | Trade execution time (IST) |
+| instrument | NIFTY or BANKNIFTY |
+| trading_symbol | Full contract symbol |
 | side | BUY or SELL |
 | price | Execution price |
-| quantity | Trade size |
-| value | Total trade value |
+| quantity | Total shares (lots × lot_size) |
+| lots | Number of lots |
+| value | Total trade value (INR) |
 | strategy | Strategy name |
-| pnl | Profit/Loss amount |
+| pnl | Profit/Loss in INR |
 | pnl_percent | P&L percentage |
-| stop_loss | Stop loss price |
-| take_profit | Take profit price |
+
+## Paper Trading Simulation
+
+In paper trading mode, the bot:
+- Simulates realistic Nifty/BankNifty price movements
+- Calculates proper margin requirements (~12% for futures)
+- Tracks P&L accurately
+- Enforces all risk management rules
+
+This allows strategy testing without real capital.
+
+## Important Considerations
+
+### Lot Sizes
+- **NIFTY**: 25 shares per lot (check NSE for updates)
+- **BANKNIFTY**: 15 shares per lot (check NSE for updates)
+- Lot sizes change periodically - update in `.env`
+
+### Margin Requirements
+- F&O trading requires margin (typically 10-15% of contract value)
+- Bot calculates margin for paper trading
+- Live trading uses actual margin from Zerodha
+
+### Market Hours
+- NSE F&O: 9:15 AM - 3:30 PM IST
+- Pre-market: 9:00 AM - 9:15 AM (not traded)
+- Bot checks market hours before trading
+
+### Access Token
+- Kite Connect access token expires daily
+- Must regenerate before each trading session
+- Consider automation for token generation
 
 ## Safety Features
 
-1. **Paper Trading** - Default mode for testing
-2. **Stop Loss** - Automatic loss limiting
+1. **Paper Trading** - Default mode for safe testing
+2. **Stop Loss** - Automatic loss limiting (1% default for F&O)
 3. **Take Profit** - Lock in gains
-4. **Daily Loss Limit** - Stop trading after 5% loss
+4. **Daily Loss Limit** - Stop trading after 5% daily loss
 5. **Max Drawdown** - Circuit breaker at 10% drawdown
-6. **Position Sizing** - Risk-based quantity calculation
-7. **Input Validation** - Prevents invalid configurations
+6. **Max Lots Limit** - Cap on position size
+7. **Market Hours Check** - Only trades during NSE hours
+8. **Input Validation** - Prevents invalid configurations
 
 ## Architecture
 
 ```
 BOT_2.0.py
-├── TradingBot (Main orchestrator)
+├── ZerodhaTradingBot (Main orchestrator)
 ├── Strategy (Abstract base class)
 │   ├── WWTStrategy
 │   └── ORBStrategy
-├── RiskManager (Position sizing, limits)
-├── TradeJournal (Trade history, metrics)
-├── PaperTrader (Simulated trading)
-└── Data Classes (Trade, Position)
+├── RiskManager (Lot sizing, risk limits)
+├── TradeJournal (Trade history, P&L metrics)
+├── PaperTrader (Simulated F&O trading)
+└── Data Classes
+    ├── Trade
+    ├── Position
+    └── FNOContract
 ```
-
-## Important Notes
-
-⚠️ **WARNINGS:**
-- Live trading is disabled by default (PAPER_TRADING=true)
-- Never commit `.env` file with real API keys
-- Start with paper trading to test strategies
-- Past performance doesn't guarantee future results
-- Cryptocurrency trading involves significant risk
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **TA-Lib not found**: Install system TA-Lib first
-2. **API errors**: Check credentials in `.env`
-3. **WebSocket disconnects**: Automatic reconnection enabled
-4. **Module not found**: Run `pip install -r requirements.txt`
-5. **python-dotenv not installed**: Optional - bot will use system environment variables
-6. **No API keys configured**: Bot will use mock data for strategy testing in paper mode
+1. **kiteconnect not found**
+   ```bash
+   pip install kiteconnect
+   ```
 
-### Mock Data Mode
+2. **TA-Lib not found**: Install system TA-Lib first
 
-If API keys are not configured and paper trading is enabled, the bot will:
-- Generate mock historical data for strategy initialization
-- Allow testing of strategy logic without real market connection
-- Display warning about offline/mock mode
+3. **Access token expired**: Regenerate via Kite Connect login
 
-This is useful for:
-- Testing strategy implementation
-- Validating risk management logic
-- Learning the bot interface
+4. **Invalid trading symbol**: Check NSE for correct expiry format
+
+5. **Insufficient margin**: Reduce MAX_LOTS or increase capital
+
+6. **Module not found**: Run `pip install -r requirements.txt`
 
 ### Logs
 
-Check `trading_bot.log` for detailed error messages.
+Check `zerodha_bot.log` for detailed error messages.
 
 ## Future Improvements
 
-- [ ] Backtesting engine
-- [ ] More strategy options (RSI, MACD, Bollinger Bands)
-- [ ] Web dashboard
-- [ ] Telegram notifications
-- [ ] Multi-pair trading
-- [ ] Database storage
-- [ ] Unit tests
+- [ ] Auto token generation script
+- [ ] Options (CE/PE) trading support
+- [ ] Backtesting with historical NSE data
+- [ ] Multiple index support (Nifty Bank, Nifty IT, etc.)
+- [ ] Telegram/Discord notifications
+- [ ] Web dashboard with live P&L
+- [ ] Options Greeks calculations
+- [ ] Advanced strategies (Iron Condor, Straddle, etc.)
+
+## Regulatory Compliance
+
+⚠️ **IMPORTANT:**
+- F&O trading is regulated by SEBI
+- Ensure compliance with all NSE/BSE regulations
+- Maintain proper records for tax purposes
+- Consult a financial advisor before live trading
+- Losses in F&O can exceed invested capital
 
 ## License
 
@@ -258,4 +302,10 @@ MIT License
 
 ## Disclaimer
 
-This software is for educational purposes only. Trading cryptocurrencies involves substantial risk of loss. Always do your own research and never trade with money you cannot afford to lose.
+**This software is for educational purposes only.**
+
+Trading in Futures & Options involves substantial risk and is not suitable for all investors. Past performance is not indicative of future results. The risk of loss in trading F&O can be substantial. You should carefully consider whether trading is suitable for you in light of your financial condition.
+
+Never trade with money you cannot afford to lose. The developers are not responsible for any financial losses incurred using this software.
+
+**Always test with paper trading first!**
