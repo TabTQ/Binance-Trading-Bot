@@ -604,6 +604,12 @@ class TradingBot:
         self.logger.info(f"Fetching historical data for {self.trade_symbol}...")
 
         try:
+            # Check if API keys are available
+            if not config.KEY or not config.SECRET:
+                self.logger.warning("API keys not configured. Using mock historical data for testing.")
+                # Generate mock data for testing without API keys
+                return self._generate_mock_historical_data()
+
             if self.paper_trader:
                 # For paper trading, we still need real market data
                 temp_client = Client(config.KEY, config.SECRET, tld='com')
@@ -639,6 +645,44 @@ class TradingBot:
         except Exception as e:
             self.logger.error(f"Error fetching historical data: {e}")
             raise
+
+    def _generate_mock_historical_data(self) -> pd.DataFrame:
+        """Generate mock historical data for testing without API keys"""
+        self.logger.info("Generating mock historical data...")
+
+        # Create 50 mock candles with realistic price movements
+        base_price = 50000.0  # Base price for BTC
+        data = []
+
+        for i in range(50):
+            # Simulate price movement
+            change = np.random.randn() * 100
+            open_price = base_price + change
+            high_price = open_price + abs(np.random.randn() * 50)
+            low_price = open_price - abs(np.random.randn() * 50)
+            close_price = open_price + np.random.randn() * 30
+            volume = np.random.randint(100, 1000)
+
+            data.append({
+                'open_time': i,
+                'open': open_price,
+                'high': high_price,
+                'low': low_price,
+                'close': close_price,
+                'volume': volume,
+                'close_time': i,
+                'qav': 0,
+                'num_trades': 0,
+                'taker_base_vol': 0,
+                'taker_quote_vol': 0,
+                'is_best_match': True
+            })
+
+            base_price = close_price  # Update base for next candle
+
+        df = pd.DataFrame(data)
+        self.logger.info(f"Generated {len(df)} mock candles")
+        return df
 
     def execute_order(self, side: str, price: float, signal_type: str = 'STRATEGY'):
         """Execute a buy or sell order with risk management"""
@@ -781,9 +825,16 @@ class TradingBot:
         self.logger.info(f"Trading {self.trade_symbol} with {self.strategy.name} strategy")
         self.reconnect_count = 0
 
-    def on_close(self, ws, close_status_code, close_msg):
+    def on_close(self, ws, *args):
         """WebSocket connection closed"""
-        self.logger.warning(f"WebSocket closed: {close_status_code} - {close_msg}")
+        # Handle different websocket-client versions (some pass close_status_code and close_msg)
+        if len(args) >= 2:
+            close_status_code, close_msg = args[0], args[1]
+            self.logger.warning(f"WebSocket closed: {close_status_code} - {close_msg}")
+        elif len(args) == 1:
+            self.logger.warning(f"WebSocket closed: {args[0]}")
+        else:
+            self.logger.warning("WebSocket connection closed")
 
         if self.running and self.reconnect_count < config.WS_RECONNECT_ATTEMPTS:
             self.reconnect_count += 1
@@ -873,11 +924,18 @@ class TradingBot:
 
         # Validate configuration
         errors = config.validate_config()
-        if errors and not config.PAPER_TRADING:
-            for error in errors:
-                self.logger.error(error)
-            print("Configuration errors found. Please check .env file.")
-            return
+        if errors:
+            if not config.PAPER_TRADING:
+                for error in errors:
+                    self.logger.error(error)
+                print("Configuration errors found. Please check .env file.")
+                return
+            else:
+                # Paper trading mode - warn about missing keys but allow continuation
+                self.logger.warning("API keys not configured. Some features may be limited.")
+                print("\nWARNING: API keys not configured.")
+                print("Bot will run in offline/mock mode for testing.")
+                print("To connect to live market data, configure API keys in .env file.\n")
 
         # Step 1: Select instrument
         self.symbol, instrument_name = self.select_instrument()

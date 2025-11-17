@@ -223,6 +223,20 @@ BOT_2.0.py
 2. **API errors**: Check credentials in `.env`
 3. **WebSocket disconnects**: Automatic reconnection enabled
 4. **Module not found**: Run `pip install -r requirements.txt`
+5. **python-dotenv not installed**: Optional - bot will use system environment variables
+6. **No API keys configured**: Bot will use mock data for strategy testing in paper mode
+
+### Mock Data Mode
+
+If API keys are not configured and paper trading is enabled, the bot will:
+- Generate mock historical data for strategy initialization
+- Allow testing of strategy logic without real market connection
+- Display warning about offline/mock mode
+
+This is useful for:
+- Testing strategy implementation
+- Validating risk management logic
+- Learning the bot interface
 
 ### Logs
 

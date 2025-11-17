@@ -3,10 +3,14 @@ Configuration management for Binance Trading Bot
 Uses environment variables for security
 """
 import os
-from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# Try to load dotenv if available (optional dependency)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed, will use system environment variables only
+    pass
 
 # API Configuration
 KEY = os.getenv('BINANCE_API_KEY', '')
