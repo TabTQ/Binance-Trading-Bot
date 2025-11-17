@@ -1,0 +1,27 @@
+# Zerodha Trading Bot Dependencies
+
+# Zerodha Kite Connect API
+kiteconnect>=4.0.0
+
+# Data processing
+pandas>=1.3.0
+numpy>=1.21.0
+
+# Technical Analysis
+TA-Lib>=0.4.24
+
+# Web server for OAuth callback (for authentication)
+Flask>=2.0.0
+
+# TOTP generation for automated login (optional)
+pyotp>=2.6.0
+
+# HTTP requests
+requests>=2.25.0
+
+# Logging (built-in but included for clarity)
+# logging - part of standard library
+
+# Optional: For better async support
+# gevent>=21.0.0
+# gevent-websocket>=0.10.0
